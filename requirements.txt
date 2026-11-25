@@ -3,3 +3,5 @@ requests>=2.28.0
 playwright>=1.40.0
 # 可选: 模拟 Chrome TLS 指纹，手动流程下过 CF 校验更稳
 curl_cffi>=0.6.0
+# 可选: 直链自动获取（min-CDP 客户端）
+websocket-client>=1.0.0

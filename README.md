@@ -35,8 +35,23 @@ python3 decrypt_day_downloader.py
 2. playwright 驱动本机 Chrome（headful）自动过 Cloudflare，轮询拿到 `cf_clearance` 后顺带读取 UA 和页面 HTML；浏览器档案持久化在 `.cf_profile/`，cookie 有效期内重跑免验证。未装 playwright 时回退手动粘贴流程
 3. 从页面提取内部 ID 和版本名（兼容 cuid / nanoid 两种格式），动态编码 CBOR payload，多组 `(appId, version)` 组合自动重试
 4. 输出下载链接列表
+5. 自动获取最终直链（可选，依赖 `websocket-client`）：脚本自动拉起带调试端口的独立 Chrome 实例，直接产出 presigned 下载直链
 
-注意：`.cf_profile/` 内含会话 Cookie，已加入 `.gitignore`，不要提交到仓库。
+注意：
+
+- `.cf_profile/`、`.chrome_cdp_profile/` 内含会话 Cookie，已加入 `.gitignore`，不要提交到仓库
+- Chrome 136+ 禁止默认 profile 开调试端口，脚本会用独立档案目录 `.chrome_cdp_profile/` 自动拉起实例，无需手动配置
+
+## 直链获取原理
+
+`/app/{id}/dl/{file_id}` 页面的 "Get download link" 按钮背后是:
+
+- 服务端按 **Referer**（`/app/{id}`）决定渲染 dl 专属面板，不带 Referer 会渲染成普通应用页
+- 点击按钮后页面执行 Cloudflare Turnstile（invisible），token 回调后 `POST /app/{id}/dl/{file_id}?`（FormData: `token` + `hasher`），响应中带直链
+- 直链是站内 presigned URL（`/fs/dl/s/...`，AWS SigV4，**有效期仅 5 分钟**）
+- 免费链路有每日限额，Premier 文件需要登录 + 升级账号
+
+自动化上有个关键坑: **Turnstile 会检测 CDP Runtime.enable 域**，playwright attach 必开该域，widget 直接静默拒绝出 token。脚本用只开 Page/DOM/Input 三域的最小 CDP 客户端（`websocket-client` 手写）绕开: DOM 域定位按钮坐标、Input 域发真实鼠标事件（两段式: 第一次点击取直链，按钮变 Download 后再点一次才 `window.open`），直链标签页从 DevTools HTTP 接口 `/json/list` 抓取。
 
 ![img_5.png](img/img_5.png)
 

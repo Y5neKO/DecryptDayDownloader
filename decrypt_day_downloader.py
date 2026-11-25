@@ -15,6 +15,7 @@ cf_clearance 自动化: 优先使用 Playwright 驱动本机真实 Chrome（head
 """
 
 import re
+import time
 import webbrowser
 import subprocess
 import json
@@ -28,6 +29,58 @@ SITE_VERSION = "6.4.0"
 
 # 浏览器档案目录（持久化 cf_clearance，复用免验证）
 PROFILE_DIR = Path(__file__).parent / ".cf_profile"
+# CDP 直链获取用的独立 Chrome 档案（Chrome 136+ 禁止默认 profile 开调试端口）
+CDP_PROFILE_DIR = Path(__file__).parent / ".chrome_cdp_profile"
+CDP_ENDPOINT = "http://127.0.0.1:9222"
+
+
+def _cdp_alive(timeout: float = 3.0) -> bool:
+    """探测 CDP 端口是否可用"""
+    try:
+        return requests.get(f"{CDP_ENDPOINT}/json/version", timeout=timeout).ok
+    except Exception:
+        return False
+
+
+def _launch_debug_chrome() -> bool:
+    """启动带调试端口的独立 Chrome 实例"""
+    import sys
+    import time as _time
+
+    candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Beta",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    binary = next((b for b in candidates if Path(b).exists()), None)
+    if not binary:
+        print(f"未找到 Chrome（{sys.platform}），请手动启动:")
+        print(f'  "<Chrome路径>" --remote-debugging-port=9222 --user-data-dir="{CDP_PROFILE_DIR}"')
+        return False
+
+    print("正在启动带调试端口的 Chrome 实例...")
+    try:
+        subprocess.Popen(
+            [binary,
+             f"--remote-debugging-port=9222",
+             f"--user-data-dir={CDP_PROFILE_DIR}",
+             "--no-first-run",
+             "--no-default-browser-check",
+             "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"启动失败: {e}")
+        return False
+
+    for _ in range(15):
+        if _cdp_alive():
+            print("CDP 端口就绪")
+            return True
+        _time.sleep(1)
+    print("Chrome 已启动但 CDP 端口未就绪")
+    return False
 
 
 def get_user_input(prompt: str) -> str:
@@ -383,6 +436,164 @@ def fetch_file_list(app_id: str, cf_clearance: str, user_agent: str, form_data: 
         return None
 
 
+def resolve_dl_direct_links(dl_tasks: list, cdp_endpoint: str = "http://127.0.0.1:9222", max_wait: int = 120) -> dict:
+    """
+    通过调试端口的本机 Chrome 自动获取直链（最小 CDP 客户端）
+
+    只使用 Page/DOM/Input 三个域，不开启 Runtime.enable（Turnstile 会检测
+    Runtime 域并静默拒绝出 token，playwright attach 必开该域因此不可用）。
+
+    页面交互流程（服务端按 Referer 决定渲染 dl 面板，故导航必须带 Referer）:
+    Get download link -> 转圈等 Turnstile token -> 按钮变 Download
+    -> 再点击一次 -> window.open 直链新标签页。
+
+    前置: Chrome 以 --remote-debugging-port=9222 --user-data-dir=<独立目录> 启动
+    （Chrome 136+ 禁止默认 profile 开调试端口，脚本会自动拉起独立实例）。
+    返回: {dl_url: 直链或 None}
+    """
+    import re as _re
+    from websocket import create_connection  # pip install websocket-client
+
+    results = {url: None for url, _ in dl_tasks}
+    if not _cdp_alive() and not _launch_debug_chrome():
+        return results
+
+    class CDP:
+        def __init__(self, ws_url):
+            self.ws = create_connection(ws_url, timeout=30)
+            self.mid = 0
+
+        def send(self, method, params=None, timeout=30):
+            self.mid += 1
+            self.ws.send(json.dumps({"id": self.mid, "method": method, "params": params or {}}))
+            self.ws.settimeout(timeout)
+            while True:
+                msg = json.loads(self.ws.recv())
+                if msg.get("id") == self.mid:
+                    return msg
+
+        def close(self):
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+    def list_targets():
+        return requests.get(f"{cdp_endpoint}/json/list", timeout=5).json()
+
+    def find_free_page_tab():
+        """找一个 decrypt.day 的 page tab（复用），否则取任意 page tab"""
+        tabs = [t for t in list_targets() if t.get("type") == "page"]
+        for t in tabs:
+            if "decrypt.day" in t.get("url", ""):
+                return t
+        return tabs[0] if tabs else None
+
+    def cdp_click(cdp, node_id):
+        r = cdp.send("DOM.getBoxModel", {"nodeId": node_id})
+        model = r.get("result", {}).get("model", {}).get("content")
+        if not model:
+            return False
+        x = (model[0] + model[2]) / 2
+        y = (model[1] + model[5]) / 2
+        for args in [{"type": "mouseMoved", "x": x, "y": y},
+                     {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                     {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}]:
+            cdp.send("Input.dispatchMouseEvent", args)
+            time.sleep(0.15)
+        return True
+
+    def btn_state(cdp):
+        """返回按钮可见文本: 'Get download link' / 'Getting download link...' / 'Download' / None"""
+        r = cdp.send("DOM.getDocument", {"depth": 8})
+        root = r["result"]["root"]["nodeId"]
+        r = cdp.send("DOM.querySelector", {"nodeId": root, "selector": "button.btn-download"})
+        nid = r.get("result", {}).get("nodeId")
+        if not nid or int(nid) == 0:
+            return None, None
+        r = cdp.send("DOM.getOuterHTML", {"nodeId": nid})
+        html = r.get("result", {}).get("outerHTML", "")
+        text = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", html)).strip()
+        return nid, text
+
+    for dl_url, referer in dl_tasks:
+        print(f"\n处理: {dl_url}")
+        tab = find_free_page_tab()
+        if not tab:
+            print("  调试 Chrome 中无可用标签页")
+            continue
+        cdp = None
+        direct = None
+        try:
+            cdp = CDP(tab["webSocketDebuggerUrl"])
+            cdp.send("Page.enable")
+            cdp.send("Page.navigate", {"url": dl_url, "referrer": referer})
+            time.sleep(8)
+
+            # 第一段: 等 Get download link 按钮出现并点击
+            nid = None
+            for i in range(30):
+                nid, text = btn_state(cdp)
+                if nid and "Get download link" in text:
+                    break
+                if nid and text == "Download":
+                    break  # 直链已在缓存中，直接进入第二段
+                nid = None
+                time.sleep(1)
+            if not nid:
+                print("  下载按钮未出现（面板未渲染）")
+                continue
+            if not cdp_click(cdp, nid):
+                print("  按钮点击失败")
+                continue
+
+            # 等待 token: 按钮转圈后变 Download
+            state = None
+            for i in range(max_wait):
+                nid, text = btn_state(cdp)
+                state = text
+                if text == "Download":
+                    break
+                time.sleep(2)
+            if state != "Download":
+                print(f"  取直链未完成（按钮状态: {state!r}，可能需要登录或超过免费限额）")
+                continue
+
+            # 第二段: 点击 Download -> window.open 直链
+            # 直链特征: 站内 presigned 下载路径 /fs/dl/，或任意外域存储 URL
+            cdp_click(cdp, nid)
+            deadline = time.time() + 30
+            while time.time() < deadline and not direct:
+                for t in list_targets():
+                    u = t.get("url", "")
+                    if t.get("type") == "page" and u.startswith("http"):
+                        if "/fs/dl/" in u or "decrypt.day" not in u:
+                            direct = u
+                            # 关掉直链标签页（避免真的开始下载文件）
+                            requests.get(f"{cdp_endpoint}/json/close/{t['id']}", timeout=5)
+                            break
+                time.sleep(1)
+
+            if direct:
+                print(f"  直链: {direct}")
+                results[dl_url] = direct
+            else:
+                print("  未捕获直链标签页")
+        except Exception as e:
+            print(f"  处理异常: {str(e)[:150]}")
+        finally:
+            if cdp:
+                cdp.close()
+            # 让 tab 回到空白，避免残留页面影响下个文件
+            try:
+                t2 = find_free_page_tab()
+                if t2:
+                    requests.get(f"{cdp_endpoint}/json/close/{t2['id']}", timeout=5)
+            except Exception:
+                pass
+
+    return results
+
 def manual_cf_flow(app_id: str) -> Optional[dict]:
     """手动流程: 打开浏览器 -> 用户粘贴 cf_clearance -> requests 拉页面"""
     page_url = f"https://decrypt.day/app/{app_id}?/files"
@@ -506,17 +717,38 @@ def main():
 
     referer = f"https://decrypt.day/app/{app_id}"
 
+    dl_tasks = []
     for i, file_info in enumerate(files, 1):
         file_id = file_info["id"]
         storage = file_info["storage"]
         download_url = f"https://decrypt.day/app/{app_id}/dl/{file_id}"
+        dl_tasks.append((download_url, referer))
         print(f"\n文件 {i}: {file_id}")
         print(f"  存储类型: {storage}")
         print(f"  下载链接: {download_url}")
         print(f"  Referer: {referer}")
 
+    # Step 7: CDP 接管真实 Chrome 自动获取直链
+    print("\n[Step 7] 自动获取最终下载直链")
+    go = get_user_input("通过 CDP 接管本机 Chrome 自动获取直链？(Y/n): ")
+    if go.strip().lower() in ("", "y", "yes"):
+        results = resolve_dl_direct_links(dl_tasks)
+        ok = {u: d for u, d in results.items() if d}
+        if ok:
+            print("\n" + "=" * 60)
+            print("最终直链")
+            print("=" * 60)
+            for u, d in ok.items():
+                print(f"\n{u}\n  -> {d}")
+        else:
+            print("\n未能自动获取直链。")
+    else:
+        print("跳过自动获取。")
+
     print("\n" + "=" * 60)
-    print("请在浏览器中打开下载链接，需要携带 Referer")
+    print("提示: 直链为 presigned URL，有效期仅 5 分钟，获取后尽快下载:")
+    print('  curl -L -o 文件名.ipa "<直链>"')
+    print("未获取到直链时（Premier 文件/限额），可在浏览器手动打开下载链接（需携带 Referer）")
     print("=" * 60)
 
 

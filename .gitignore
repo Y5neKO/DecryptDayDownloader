@@ -2,3 +2,4 @@
 __pycache__/
 # 浏览器持久化档案，内含 cf_clearance 等会话 Cookie，禁止入库
 .cf_profile/
+.chrome_cdp_profile/
