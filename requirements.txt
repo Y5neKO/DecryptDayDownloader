@@ -1,1 +1,5 @@
 requests>=2.28.0
+# 可选: cf_clearance 自动化（不装则回退手动粘贴流程）
+playwright>=1.40.0
+# 可选: 模拟 Chrome TLS 指纹，手动流程下过 CF 校验更稳
+curl_cffi>=0.6.0
