@@ -1,89 +1,94 @@
-# README
+# DecryptDayDownloader
 
 decrypt.day下载砸壳ipa的时候经常遇到广告拦截后获取不到下载链接的情况，类似chrome这种自带拦截的又关不掉，非常麻烦，简单写了个脚本来半自动获取下载链接
 
 ![img_6.png](img/img_6.png)
 
-## 半自动脚本
+## 原理
 
-直接运行
+`POST /app/{id}?/files` 是 SvelteKit form action，**app 归属由 POST body 里的 CBOR payload 决定，URL 里的 app id 只用于 Referer/路由**。
+
+payload 是 CBOR 编码的 map，以字节十进制 CSV 形式作为 `data` 字段提交：
+
+```json
+{"appId": "<应用内部ID>", "version": "<版本名>", "isPremier": undefined}
+```
+
+几个关键点：
+
+- `appId` 是站点数据库的内部 ID，**不是** App Store 的数字 ID（`id1467190251` 这种）。老记录是 cuid 格式（如 `cl9se40t70055dofw1xo61mwx`，2022 年批量入库），新记录是 nanoid 格式（如 `p7-UcPBfHBDiVqQ0BZ6HF`）
+- 内部 ID 以明文存在于应用页面源码的 SvelteKit 序列化数据里：`app:{id:"<内部ID>",app_id:"id<数字>",...}`，版本记录则形如 `f.id="<版本ID>";f.name="<版本名>"`
+- `version` 是页面上选中的版本名（如 `1.0.0`），`isPremier` 是 CBOR undefined（`0xF7`）
+
+> 旧版脚本把抓包时的 payload 整个硬编码了，里面的 `appId` 是抓包那个应用的内部 ID，所以无论输入什么 app id，服务端都按 body 里的 appId 返回同一个应用的文件列表。
+
+## 自动脚本
+
+```bash
+pip install requests playwright curl_cffi
+python3 decrypt_day_downloader.py
+```
+
+流程：
+
+1. 输入 app id（如 `id6754899430`）
+2. playwright 驱动本机 Chrome（headful）自动过 Cloudflare，轮询拿到 `cf_clearance` 后顺带读取 UA 和页面 HTML；浏览器档案持久化在 `.cf_profile/`，cookie 有效期内重跑免验证。未装 playwright 时回退手动粘贴流程
+3. 从页面提取内部 ID 和版本名（兼容 cuid / nanoid 两种格式），动态编码 CBOR payload，多组 `(appId, version)` 组合自动重试
+4. 输出下载链接列表
+
+注意：`.cf_profile/` 内含会话 Cookie，已加入 `.gitignore`，不要提交到仓库。
 
 ![img_5.png](img/img_5.png)
 
-## 手动获取
+## 手动构造（备用）
 
-### 获取 cf_clearance
+只想手动 curl 的话按下面三步走。
 
-![img.png](img/img.png)
+### 1. 拿内部 ID 和版本名
 
-### 获取文件列表
+浏览器打开应用页面，查看源码，搜 `app_id:"id<数字>"`：
 
-#### HTTP
+- 它前面的 `id:"..."` 就是应用内部 ID（主记录）
+- `x.id="...";x.name="1.0.0"` 这种闭包赋值里的 `id` 是版本 ID，`name` 是版本名
 
-```http request
-POST /app/id1467190251?/files HTTP/1.1
-Host: decrypt.day
-Accept: */*
-Accept-Encoding: gzip, deflate, br, zstd
-Accept-Language: zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6,zh-TW;q=0.5
-Cache-Control: no-cache
-Pragma: no-cache
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryh7BXBC9F3IBfdTRw
-Content-Length: 349
-Origin: https://decrypt.day
-Referer: https://decrypt.day/app/id1467190251
-User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36
-Sec-Fetch-Site: same-origin
-Sec-Fetch-Mode: cors
-Sec-Fetch-Dest: empty
-Sec-CH-UA: "Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"
-Sec-CH-UA-Full-Version: "145.0.7632.76"
-Sec-CH-UA-Full-Version-List: "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.7632.76", "Chromium";v="145.0.7632.76"
-Sec-CH-UA-Platform: "macOS"
-Sec-CH-UA-Platform-Version: "15.7.1"
-Sec-CH-UA-Arch: "arm"
-Sec-CH-UA-Bitness: "64"
-Sec-CH-UA-Mobile: ?0
-Priority: u=1, i
-Cookie: cf_clearance=ifpkRcxJ0h2x1omPT5mBWxuG4PTayy5B03S4buMN9c4-1772366056-1.2.1.1-byOxO5Ke3xU.mqRhZbI3OKeP112TIFfQLC64xb7OxV1fjtwMLbU2aXPfEGfj2NjPAmXevs2uTvjp1Tk.pQkA6Kd.U52LoDE5gtvV4zMiusbN6fpQaKSqR9kVLz8VeTCZe1CgM43iCUSMNMyjSDrirJD2oCz.6R8cghAJRQv1SdkKR.3x.0fbEOs40SU77cL_KOXRsxvcrNUKzE6TGIvmGRdUhYU61MLXmyjqq5CQJd1KitYrnUt1FH3nCglIMJlv
+### 2. 编码 CBOR payload
 
-------WebKitFormBoundaryh7BXBC9F3IBfdTRw
-Content-Disposition: form-data; name="data"
+把 `{"appId": 内部ID, "version": 版本名, "isPremier": undefined}` 按 CBOR 编码，每个字节转十进制逗号分隔。可以用脚本里的 `encode_cbor_payload()`，或者 `cbor2` 库自编（注意 `isPremier` 要 `0xF7` 即 undefined，不是 null）。
 
+原始抓包示例（Chrome 应用，version 6.4.0）：
+
+```
 163,101,97,112,112,73,100,120,25,99,108,57,115,101,52,48,116,55,48,48,53,53,100,111,102,119,49,120,111,54,49,109,119,120,103,118,101,114,115,105,111,110,101,54,46,52,46,48,105,105,115,80,114,101,109,105,101,114,247
-------WebKitFormBoundaryh7BXBC9F3IBfdTRw--
 ```
 
-#### CURL
+CBOR 解码即 `{"appId":"cl9se40t70055dofw1xo61mwx","version":"6.4.0","isPremier":undefined}`
+
+### 3. 请求文件列表
 
 ```shell
 curl -X POST "https://decrypt.day/app/id1467190251?/files" \
-  -H "Accept: */*" \
-  -H "Accept-Language: zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6,zh-TW;q=0.5" \
-  -H "Cache-Control: no-cache" \
-  -H "Pragma: no-cache" \
   -H "Origin: https://decrypt.day" \
   -H "Referer: https://decrypt.day/app/id1467190251" \
-  -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36" \
-  -H 'Cookie: cf_clearance=ifpkRcxJ0h2x1omPT5mBWxuG4PTayy5B03S4buMN9c4-1772366056-1.2.1.1-byOxO5Ke3xU.mqRhZbI3OKeP112TIFfQLC64xb7OxV1fjtwMLbU2aXPfEGfj2NjPAmXevs2uTvjp1Tk.pQkA6Kd.U52LoDE5gtvV4zMiusbN6fpQaKSqR9kVLz8VeTCZe1CgM43iCUSMNMyjSDrirJD2oCz.6R8cghAJRQv1SdkKR.3x.0fbEOs40SU77cL_KOXRsxvcrNUKzE6TGIvmGRdUhYU61MLXmyjqq5CQJd1KitYrnUt1FH3nCglIMJlv' \
-  -F 'data=163,101,97,112,112,73,100,120,25,99,108,57,115,101,52,48,116,55,48,48,53,53,100,111,102,119,49,120,111,54,49,109,119,120,103,118,101,114,115,105,111,110,101,54,46,52,46,48,105,105,115,80,114,101,109,105,101,114,247'
+  -H "User-Agent: <你浏览器过CF时的UA，cf_clearance 与其绑定>" \
+  -H 'Cookie: cf_clearance=<你的值>' \
+  -F 'data=<上一步的 CSV 字节串>'
 ```
 
 ![img_1.png](img/img_1.png)
 
-### 获取下载链接
+响应里的文件 ID 通过索引引用（`"files":4` 表示文件数组在顶层第 4 个元素）。
+
+### 4. 拼下载链接
+
+```
+https://decrypt.day/app/id1467190251/dl/<file_id>
+```
 
 ![img_2.png](img/img_2.png)
 
-随机挑选拼接
+### 5. 访问下载
 
-https://decrypt.day/app/id1467190251/dl/HFZfHnt03aX1t4NrdPE0
-
-### 访问下载链接
-
-需要带上对应的referer
-
-https://decrypt.day/app/id1467190251
+需要带 Referer：`https://decrypt.day/app/id1467190251`
 
 ![img_3.png](img/img_3.png)
 
